@@ -1,11 +1,15 @@
-import sys
-import pyshark
+import datetime
+import json
 import logging
+import os
+import sys
+import xml.etree.ElementTree as ET
+
+import pyshark
 
 
-def init_loggers(debug, outfile):
-    # primary logger
-    logger = logging.getLogger("ocacc_log")
+def init_logger(debug):
+    logger = logging.getLogger(__name__)
     logger.setLevel(logging.DEBUG if debug else logging.INFO)
 
     stream_handler = logging.StreamHandler(sys.stdout)
@@ -17,73 +21,113 @@ def init_loggers(debug, outfile):
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)-8s %(message)s"))
     logger.addHandler(file_handler)
-
-    # Out (creds) logger
-    out_logger = logging.getLogger("ocacc_out")
-    out_logger.setLevel(logging.INFO)
-    out_file_handler = logging.FileHandler(outfile)
-    out_file_handler.setLevel(logging.DEBUG)
-    out_file_handler.setFormatter(logging.Formatter("%(message)s"))
-    out_logger.addHandler(out_file_handler)
-
-    return logger, out_logger
-
-
-def creds_to_loggers(logger, out_logger, field, value, ip):
-    logger.info(f"New creds part from {ip}: {field}: {value}")
-    out_logger.info(f"{field}: {value}; {ip}")
-
-
-def main(args):
-    logger, out_logger = init_loggers(args.debug, args.outfile)
-
-    # le go
     logger.info("INIT")
-    logger.debug("Init pyshark LiveCapture()")
+
+    return logger
+
+
+def default_process(args):
+    logger = init_logger(args.debug)
+    dirname = os.path.join(os.path.dirname(os.path.abspath(__file__)), datetime.datetime.now().strftime("%d.%m.%Y_%H-%M-%S"))
+    try:
+        os.mkdir(dirname)
+    except OSError:
+        logger.error("Cant create folder", exc_info=True)
+    else:
+        logger.debug(f"Directory {dirname} created")
+
+    logger.debug("Init pyshark.LiveCapture()")
     capture = pyshark.LiveCapture(args.interface,
                                   display_filter=f'ip.dst == {args.ip} and http contains "auth HTTP"',
                                   override_prefs={"ssl.keys_list": f"{args.ip},{args.port},http,{args.keyfile}"})
 
+    creds = {}
+    # creds[IP][SESSION(TCP.SRCPORT)] = {"username":"", "passwords":[]}
     logger.info("Starting capture")
-    for packet in capture.sniff_continuously():
-        logger.debug(f"Login attempt from {packet.ip.src}")
+    try:
+        for packet in capture.sniff_continuously():
+            logger.info(f"Login attempt? from {packet.ip.src}")
 
-        if "XML" in packet:
-            data = [x.strip() for x in str(packet.xml).strip().split('\n')]
-            creds_to_loggers(logger, out_logger, data[-5][1:-1].capitalize(), data[-1], packet.ip.src)
-        if "URLENCODED-FORM" in packet:
-            # Эта залупа висит в иссуях на гитхабе pyshark с 2017 года
-            # Я в ахуе сижу ебать
-            urlencoded_trash = str(packet.__getattr__("urlencoded-form"))  # Really trash SmileW
-            # FUCJ
-            if urlencoded_trash.count("<username>"):
-                index_1 = urlencoded_trash.index("<username>") + 10
-                index_2 = urlencoded_trash.index("</username>")
-                creds_to_loggers(logger, out_logger, "Username", urlencoded_trash[index_1:index_2], packet.ip.src)
-            elif urlencoded_trash.count("<password>"):
-                index_1 = urlencoded_trash.index("<password>") + 10
-                index_2 = urlencoded_trash.index("</password>")
-                creds_to_loggers(logger, out_logger, "Password", urlencoded_trash[index_1:index_2], packet.ip.src)
+            xml = str(packet.http.file_data)
+            tree = ET.ElementTree(ET.fromstring(xml)).getroot()
+
+            if not creds.get(packet.ip.src):
+                creds[packet.ip.src] = {0: {"username": "", "passwords": []}}
+            if not creds[packet.ip.src].get(packet.tcp.srcport):
+                creds[packet.ip.src][packet.tcp.srcport] = {"username": "", "passwords": []}
+
+            if "password" in xml:
+                creds[packet.ip.src][packet.tcp.srcport]["passwords"].append(tree.find("auth/password").text)
+                logger.info(f"New creds part from {packet.ip.src}:{packet.tcp.srcport}: password: {tree.find('auth/password').text}")
+            else:
+                creds[packet.ip.src][packet.tcp.srcport]["username"] = tree.find("auth/username").text
+                logger.info(f"New creds part from {packet.ip.src}:{packet.tcp.srcport}: username: {tree.find('auth/username').text}")
+    except Exception as ex:
+        logger.warning(f"Exit bec: {ex}")
+        with open(os.path.join(dirname, "extracted_creds.json"), 'w', encoding='utf-8') as creds_file:
+            json.dump(creds, creds_file)
+
+
+def cron_process(args):
+    logger = init_logger(args.debug)
+    dirname = os.path.join(os.path.dirname(os.path.abspath(__file__)), datetime.datetime.now().strftime("%d.%m.%Y_%H-%M-%S"))
+    try:
+        os.mkdir(dirname)
+    except OSError:
+        logger.error("Cant create folder", exc_info=True)
+    else:
+        logger.debug(f"Directory {dirname} created")
+
+    logger.info(f"Loading {args.pcap_file}")
+    logger.debug("Init pyshark.FileCapture")
+    capture = pyshark.FileCapture(args.pcap_file,
+                                  display_filter=f'ip.dst == {args.ip} and http contains "auth HTTP"',
+                                  override_prefs={'ssl.keys_list': f"{args.ip},{args.port},http,{args.keyfile}"})
+    creds = {}
+    # creds[IP][SESSION(TCP.SRCPORT)] = {"username":"", "passwords":[]}
+    for packet in capture:
+        xml = packet.http.file_data.replace("\\xa", "")
+        tree = ET.ElementTree(ET.fromstring(xml)).getroot()
+        if not creds.get(packet.ip.src):
+            creds[packet.ip.src] = {packet.tcp.srcport: {"username": "", "passwords": []}}
+        if not creds[packet.ip.src].get(packet.tcp.srcport):
+            creds[packet.ip.src][packet.tcp.srcport] = {"username": "", "passwords": []}
+
+        if "password" in xml:
+            creds[packet.ip.src][packet.tcp.srcport]["passwords"].append(tree.find("auth/password").text)
+        else:
+            creds[packet.ip.src][packet.tcp.srcport]["username"] = tree.find("auth/username").text
+
+    if creds:
+        with open(f"{dirname}/extracted_creds.json", 'w', encoding="utf-8") as out_creds_file:
+            out_creds_file.write(json.dumps(creds))
+        logger.info(f"Extracted {len(creds)} IPs and {sum([len(creds[x]) for x in creds])} sessions")
+    else:
+        logger.info(f"Nothing is extracted")
+
+    capture.close()
 
 
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-d", "--daemon", action="store_true", help="Запуск в режиме демона", default=False)
-    parser.add_argument("-i", "--interface", type=str, metavar="interface", help="Интерфейс на котором будет работать tshark", default="eth0")
-    parser.add_argument("-I", "--ip", type=str, metavar="ip address", help="IP ардес сервера.", default="0.0.0.0")
-    parser.add_argument("-p", "--port", type=int, metavar="port", help="Порт сервера.", default=443)
-    parser.add_argument("-k", "--keyfile", type=str, metavar="filename", help="Закрытый ключ сервера")
-    parser.add_argument("-o", "--outfile", type=str, metavar="filename", help="Out", default="./ocacc_logged_creds.txt")
-    parser.add_argument("--debug", action="store_true", help="loglevel=DEBUG", default=False)
+    parser.add_argument("mode", choices=["live", "daemon", "cron"], help="work mode.")
+    parser.add_argument("-i", "--interface", type=str, metavar="if", help="Interface for listening to TShark", default="eth0")  # Daemon+Live
+    parser.add_argument("-I", "--ip", type=str, metavar="ip", help="Server IP address for TShark filter", default="127.0.0.1")  # All
+    parser.add_argument("-p", "--port", type=int, metavar="port", help="Server port for TShark filter", default=443)  # All
+    parser.add_argument("-k", "--keyfile", type=str, metavar="keyfile", help="Server private key", default="server-key.pem")  # All
+    parser.add_argument("-f", "--pcap-file", type=str, metavar="pcapfile", help="PCAP file for \"cron\" mode")  # Cron
+    parser.add_argument("--debug", action="store_true", help="loglevel=DEBUG", default=False) # All
     parsed_args = parser.parse_args()
 
-    if parsed_args.daemon:
+    if parsed_args.mode == "daemon":
         import daemonize
         daemon = daemonize.Daemonize("ocacc", "/run/ocacc.pid",
-                                     action=main,
+                                     action=default_process,
                                      verbose=parsed_args.debug,
                                      privileged_action=lambda: parsed_args)
+    elif parsed_args.mode == "cron":
+        cron_process(parsed_args)
     else:
-        main(parsed_args)
+        default_process(parsed_args)
